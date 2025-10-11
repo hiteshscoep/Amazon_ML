@@ -1,121 +1,135 @@
-import os
+# ==========================================
+# Full pipeline: Text + Structured Features
+# ==========================================
+
 import pandas as pd
-import re
 import numpy as np
+import re
 from tqdm import tqdm
-from pathlib import Path
-from functools import partial
-import requests
-
-# --- For text embeddings ---
 from sentence_transformers import SentenceTransformer
+from sklearn.preprocessing import OneHotEncoder
 
-# --- For image embeddings ---
-import torch
-from torchvision import transforms
-from PIL import Image
-import timm
+# -----------------------------
+# 1. Load dataset
+# -----------------------------
+df = pd.read_csv('dataset/test.csv')
 
-# ----------------------------
-# 1️⃣ Load training data
-# ----------------------------
-DATASET_FOLDER = 'dataset/'
-train_csv_path = os.path.join(DATASET_FOLDER, 'train.csv')
-train_df = pd.read_csv(train_csv_path)
-print("Train dataset loaded:", train_df.shape)
+# Fill missing fields
+# -----------------------------
+# 1. Load dataset
+# -----------------------------
+df = pd.read_csv('dataset/test.csv')
 
-# ----------------------------
-# 2️⃣ Download images (requests with verify=False)
-# ----------------------------
-def download_image(image_link, savefolder):
-    if isinstance(image_link, str):
-        filename = Path(image_link).name
-        image_save_path = os.path.join(savefolder, filename)
-        if not os.path.exists(image_save_path):
-            try:
-                r = requests.get(image_link, timeout=10, verify=False)  # ignore SSL
-                with open(image_save_path, 'wb') as f:
-                    f.write(r.content)
-            except Exception as ex:
-                print(f'Warning: Not able to download - {image_link}\n{ex}')
-    return
+# -----------------------------
+# 2. Handle missing columns
+# -----------------------------
+if 'catalog_content' not in df.columns:
+    df['catalog_content'] = ''
 
-def download_images(image_links, download_folder):
-    if not os.path.exists(download_folder):
-        os.makedirs(download_folder)
+if 'Value' not in df.columns:
+    df['Value'] = 0.0
 
-    download_image_partial = partial(download_image, savefolder=download_folder)
-    for link in tqdm(image_links, desc="Downloading images"):
-        download_image_partial(link)
+if 'Unit' not in df.columns:
+    df['Unit'] = 'Ounce'  # default unit
 
-# Extract image URLs from train.csv
-image_links = train_df['image_link'].tolist()
-image_folder = os.path.join(DATASET_FOLDER, 'images/')
-download_images(image_links, image_folder)
-print("All images downloaded to:", image_folder)
+# Fill missing values in existing columns
+df['catalog_content'] = df['catalog_content'].fillna('')
+df['Value'] = df['Value'].fillna(0.0)
+df['Unit'] = df['Unit'].fillna('Ounce')
 
-# ----------------------------
-# 3️⃣ Text Embeddings
-# ----------------------------
-def clean_text(text):
-    return re.sub(r'\s+', ' ', text).strip()
 
-train_texts = train_df['catalog_content'].apply(clean_text).tolist()
+# -----------------------------
+# 2. Helper functions
+# -----------------------------
 
-text_model = SentenceTransformer('all-MiniLM-L6-v2', device='cpu')  # 'cuda' if available
+# Extract Item Name, Bullet Points, Product Description
+def split_catalog_text(text):
+    # Item Name
+    name_match = re.search(r'Item Name:\s*(.*?)(?:Bullet Point|Product Description|$)', text, re.IGNORECASE|re.DOTALL)
+    name = name_match.group(1).strip() if name_match else ''
 
-print("Computing text embeddings...")
-text_embeddings = text_model.encode(
-    train_texts,
-    batch_size=64,
-    show_progress_bar=True
-)
+    # Bullet Points (concatenated)
+    bullets = re.findall(r'Bullet Point \d+: (.*?)(?=Bullet Point \d+:|Product Description|$)', text, re.IGNORECASE|re.DOTALL)
+    bullets_text = ' '.join(bullets) if bullets else ''
+
+    # Product Description
+    desc_match = re.search(r'Product Description:\s*(.*?)(?=Value|Unit|$)', text, re.IGNORECASE|re.DOTALL)
+    desc = desc_match.group(1).strip() if desc_match else ''
+
+    # Combine all text fields into a single string for embedding
+    combined_text = ' '.join([name, bullets_text, desc])
+    return combined_text
+
+# Extract weight from text (oz, fl oz, lb, pounds)
+def extract_weight(text):
+    match = re.search(r'(\d+(\.\d+)?)\s*(oz|fl oz|pounds|lb)', text, re.IGNORECASE)
+    return float(match.group(1)) if match else 0.0
+
+# Extract pack size from text (Pack of X, X Bars/pieces/Count)
+def extract_pack_size(text):
+    match = re.search(r'Pack of (\d+)', text, re.IGNORECASE)
+    if match: 
+        return int(match.group(1))
+    match2 = re.findall(r'(\d+)\s*(Bars|pieces|Count)', text, re.IGNORECASE)
+    return int(match2[0][0]) if match2 else 1
+
+# Extract count based on unit type
+def extract_count(unit, text):
+    if unit.lower() == 'count':
+        return extract_pack_size(text)
+    return 1
+
+# -----------------------------
+# 3. Extract structured features
+# -----------------------------
+print("Extracting structured features...")
+
+# Value (numeric)
+value_feature = df['Value'].fillna(0.0).astype(float).values.reshape(-1,1)
+
+# Unit (categorical → one-hot)
+unit_feature = df['Unit'].values.reshape(-1,1)
+unit_encoder = OneHotEncoder(sparse_output=False)
+unit_onehot = unit_encoder.fit_transform(unit_feature)
+
+# Weight, Pack size, Count
+weight_feature = df['catalog_content'].apply(extract_weight).values.reshape(-1,1)
+pack_feature = df['catalog_content'].apply(extract_pack_size).values.reshape(-1,1)
+count_feature = np.array([extract_count(u,t) for u,t in zip(df['Unit'], df['catalog_content'])]).reshape(-1,1)
+
+# Combine all structured features
+structured_features = np.hstack([value_feature, weight_feature, pack_feature, count_feature, unit_onehot])
+print("Structured features shape:", structured_features.shape)
+
+# -----------------------------
+# 4. Generate text embeddings
+# -----------------------------
+print("Generating text embeddings with all-mpnet-base-v2...")
+model = SentenceTransformer('all-mpnet-base-v2')
+
+# Combine all text fields safely
+texts = df['catalog_content'].apply(split_catalog_text).tolist()
+
+# Batch-wise embedding (memory efficient)
+batch_size = 512
+embeddings = []
+
+for i in tqdm(range(0, len(texts), batch_size)):
+    batch_texts = texts[i:i+batch_size]
+    batch_emb = model.encode(batch_texts, show_progress_bar=False)
+    embeddings.append(batch_emb)
+
+text_embeddings = np.vstack(embeddings)
 print("Text embeddings shape:", text_embeddings.shape)
 
-# Save text embeddings
-np.save(os.path.join(DATASET_FOLDER, 'text_embeddings.npy'), text_embeddings)
-print("Text embeddings saved to text_embeddings.npy")
+# -----------------------------
+# 5. Fuse embeddings + structured
+# -----------------------------
+fused_features = np.hstack([text_embeddings, structured_features])
+print("Fused features shape:", fused_features.shape)
 
-# ----------------------------
-# 4️⃣ Image Embeddings
-# ----------------------------
-# Preprocessing
-preprocess = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                         std=[0.229, 0.224, 0.225])
-])
-
-def load_image(image_path):
-    try:
-        img = Image.open(image_path).convert('RGB')
-        return preprocess(img)
-    except:
-        return None
-
-# Load pretrained model (ResNet50)
-image_model = timm.create_model('resnet50', pretrained=True)
-image_model = torch.nn.Sequential(*list(image_model.children())[:-1])  # remove classifier
-image_model.eval()
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-image_model.to(device)
-
-# Compute image embeddings
-image_embeddings = []
-print("Computing image embeddings...")
-for img_file in tqdm(os.listdir(image_folder), desc="Processing images"):
-    img_path = os.path.join(image_folder, img_file)
-    img_tensor = load_image(img_path)
-    if img_tensor is not None:
-        img_tensor = img_tensor.unsqueeze(0).to(device)
-        with torch.no_grad():
-            emb = image_model(img_tensor)
-        emb = emb.squeeze().cpu().numpy()
-        image_embeddings.append(emb)
-image_embeddings = np.array(image_embeddings)
-print("Image embeddings shape:", image_embeddings.shape)
-
-# Save image embeddings
-np.save(os.path.join(DATASET_FOLDER, 'image_embeddings.npy'), image_embeddings)
-print("Image embeddings saved to image_embeddings.npy")
+# -----------------------------
+# 6. Save to .npy
+# -----------------------------
+np.save('dataset/text_embeddings.npy', fused_features)
+print("Saved fused features to fused_features.npy")
