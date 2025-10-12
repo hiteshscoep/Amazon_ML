@@ -64,7 +64,7 @@ print("Loading data...")
 df = pd.read_csv("dataset/train.csv")
 y_full = df["price"].values
 
-text_embeddings = safe_load_np("dataset/text_embeddings_train.npy")
+text_embeddings = safe_load_np("dataset/text_embeddings_processed_new.npy")
 combined_features = safe_load_np("dataset/combined_features.npy")
 
 print("Raw shapes:")
